@@ -1,0 +1,29 @@
+---
+title: "dockerTesting"
+output: html_document
+date: "2024-01-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Calculating fold-change
+
+```{r}
+mat <- matrix(abs(as.integer(rnorm(50, mean = 10, sd = 3))), 
+              nrow = 5, 
+              ncol = 10)
+
+colnames(mat) <- c(paste0("cond", 1:5), paste0("ctrl", 1:5))
+rownames(mat) <- c(paste0("gene", 1:5))
+
+getlog2FC <- function(mat) {
+  cond <- mat[, startsWith(colnames(mat), "cond")]
+  ctrl <- mat[, startsWith(colnames(mat), "ctrl")]
+  
+  return(log2(cond / ctrl))
+}
+
+print(getlog2FC(mat))
+```
