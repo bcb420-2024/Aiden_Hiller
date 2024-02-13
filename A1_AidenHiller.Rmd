@@ -1,0 +1,462 @@
+---
+title: "BCB420 Assingment 1"
+author: "Aiden Hiller"
+engine: knitr
+---
+
+## Table of Contents
+
+1.  [Setting up](#setting-up)
+2.  [Overview of Data](#overview-of-data)
+3.  [Extracting Data](#extracting-data)
+4.  [Data Exploration](#data-exploration)
+5.  [Normalization](#normalization)
+6.  [References](#references)
+
+## Setting up {#setting-up}
+
+```{r setup, message=FALSE, warning=FALSE}
+
+library(ggplot2)
+library(dplyr)
+library(AnnotationDbi)
+library(DESeq2)
+library(plotly)
+library(limma)
+
+if (!requireNamespace("EnsDb.Hsapiens.v75", quietly = TRUE))
+    BiocManager::install("EnsDb.Hsapiens.v75")
+library(EnsDb.Hsapiens.v75)
+
+```
+
+## Overview of Data {#overview-of-data}
+
+The data I'm using is available at GEO accession [GSE249240](#0), which is published in relation to [this](https://pubmed.ncbi.nlm.nih.gov/38143742/) paper.
+
+The authors were interested in the natural killer (NK)-mediated immune response to Hepatitis Deltavirus/Hep Betavirus co-infection. Hepatitis Deltavirus (HDV) is a satellite virus or viroid-like element with a genome consisting of a single stranded circular RNA encoding a single protein, the delta antigen. HDV does not have a capsid of its own, and transmission is only known to occur upon co-infection with HBV.
+
+### Why is the dataset of interest to you?
+
+I'm interested in these data because HBV and HDV co-infection is considered the most severe form of hepatitis, with the highest rate of mortality. HDV is also the only known viroid-like element found in humans and I'm curious whether there might be distinct immune signatures for viroids that differentiate them from a traditional virus.
+
+### What are the control and test conditions / how many samples in each condition?
+
+Here, the authors investigated changes in gene expression of NK cells in a co-culture experiment of hepatocytes and NK cells in the presence or absence of HDV. They had 5 replicates for HDV positive (experimental) and 5 replicates for HDV negative (control).
+
+HepG2-nNTCP cells, a human hepatoma cell line overexpressing the cell surface receptor for HBV and HDV, sodium taurocholate cotransporting polypeptide, or NTCP, were incubated in the presence or absence of HDV for 5 days. At day 5, the hepatocytes were co-cultured with NK cells. After 48 hours, the authors isolated the NK cells and extracted bulk RNA, which was then sequenced using Illumina NovaSeq 6000 (See figure: Groth et al., 2023).
+
+![Experimental Design ](/home/rstudio/projects/nkcells.jpg)
+
+## Extracting Data {#extracting-data}
+
+```{r}
+# It looks like the softfile is not formatted properly, going to download manually..
+url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE249240&format=file"
+destfile <- "GSE249240_raw.tar"
+
+download.file(url, destfile, method = "auto")
+
+dir.create("GSE249240_extracted")
+untar(destfile, exdir = "GSE249240_extracted")
+```
+
+```{r}
+files <- list.files(path = "./GSE249240_extracted/", pattern = "raw.*\\.tar\\.gz$") 
+# There should be 10 of these (5 for each replicate)
+length(files)
+
+for (file in files) { 
+  path <- file.path("GSE249240_extracted", file)
+  untar(path, exdir = "GSE249240_extracted")
+}
+```
+
+```{r}
+# Upon inspecting the data these .sX files seem to be the output of the featureCounts program, split across several files.
+
+# Fortunately, they are tab-separated, but I'm going to have to do a bit of # extra work to process them.
+processFeatureCounts <- function(directory) {
+  replicate_dirs <- list.dirs(directory, full.names = TRUE, recursive = FALSE)
+  
+  replicate_data_list <- list()
+  geneIDs <- NULL 
+  
+  for (replicate_dir in replicate_dirs) {
+    feature_files <- list.files(replicate_dir, pattern = "\\.s\\d+$", 
+                                full.names = TRUE)
+    
+    replicate_counts <- NULL
+    
+    for (file_path in feature_files) {
+      data <- read.delim(file_path, header = TRUE, sep = "\t",
+                         stringsAsFactors = FALSE, skip = 1)
+      
+      if (is.null(geneIDs)) {
+        geneIDs <- data$Geneid
+      }
+      
+      counts <- data[,ncol(data)]
+      
+      if (is.null(replicate_counts)) {
+        replicate_counts <- counts
+      } else {
+        replicate_counts <- replicate_counts + counts
+      }
+    }
+    
+    if (!is.null(replicate_counts)) {  # Ensure there are counts to add
+      replicate_name <- basename(replicate_dir)
+      replicate_data_list[[replicate_name]] <- replicate_counts
+    }
+  }
+  
+  if (length(replicate_data_list) > 0) {  # Ensure there is data to combine
+    count_matrix <- do.call(cbind, replicate_data_list)
+    if (!is.null(geneIDs)) {
+      rownames(count_matrix) <- geneIDs
+    }
+    return(count_matrix)
+  } else {
+    stop("No data files were processed. Please check your directory path and file patterns.")
+  }
+}
+
+list.files("/home/rstudio")
+
+rawCounts <- processFeatureCounts("/home/rstudio/projects/GSE249240_extracted")
+rawCounts <- as.data.frame(rawCounts)
+dim(rawCounts)
+```
+
+57,280 identifiers, 10 samples
+
+Using AnnotationDBI to map the ensembl feature IDs to HGNC symbols with the EnsDb version 75.
+
+```{r}
+ensdb <- EnsDb.Hsapiens.v75
+geneIDs <- rownames(rawCounts)
+
+head(geneIDs, 10)
+```
+
+Note that gene ids have version numbers, which are not present in the EnsDB keys. This was creating an issue for 1:1 matching of the names.
+
+```{r}
+# Remove version numbers
+geneIDs <- sub("\\..*$", "", geneIDs)
+rownames(rawCounts) <- geneIDs
+
+# Map the gene IDs to HGNC symbols
+geneSymbols <- mapIds(ensdb, keys = geneIDs, column = "SYMBOL", keytype = "GENEID", multiVals = "first")
+```
+
+### Were there expression values that could not be mapped to current HUGO symbols?
+
+```{r}
+# Investigate unmapped genes
+unmappedGenes <- geneIDs[is.na(geneSymbols)]
+print(length(unmappedGenes))
+
+head(unmappedGenes)
+```
+
+These all have an accession that begins with "ENSGR," which seems to be deprecated.
+
+```{r}
+# Check expression values for unmapped genes
+sum(rawCounts[unmappedGenes,])
+```
+
+None of the unmapped symbols have any reads, so we can safely remove them.
+
+```{r}
+# Remove unmapped genes
+rawCounts <- rawCounts[!rownames(rawCounts) %in% unmappedGenes,]
+
+geneSymbols <- geneSymbols[!is.na(geneSymbols)]
+
+print(paste0("Length of geneSymbols: ", length(geneSymbols), " Length of rawCounts: ", nrow(rawCounts)))
+```
+
+### Were there expression values that were not unique for specific genes? How did you handle these?
+
+```{r}
+sum(duplicated(geneSymbols))
+```
+
+2000 Ens identifiers mapped to non-unique gene symbols. I'm concerned about losing signal from alternative splice isoforms in the case they're differentially expressed. I think the simplest way to handle these is just to make the mapped symbols unique so I can retrieve the particular Ens ID later on.
+
+```{r}
+uniqueGeneSymbols <- make.unique(geneSymbols)
+# all the non-unique symbols should now have version numbers
+sum(duplicated(uniqueGeneSymbols))
+```
+
+Assign unique rownames to the counts matrix:
+
+```{r}
+rownames(rawCounts) <- uniqueGeneSymbols
+```
+
+## Data Exploration {#data-exploration}
+
+```{r}
+# Check variation in library size across samples
+librarySizes <- colSums(rawCounts[,1:ncol(rawCounts)-1])
+
+summary(librarySizes)
+```
+
+```{r}
+boxplot(librarySizes, main = "Library Size Distribution")
+```
+
+One of the libraries is quite a lot smaller than the others, not sure if that's significant but hopefully just due to batch effects (i.e. didn't sequence to same depth).
+
+I'd like to do a PCA to check for batch effects prior to normalization:
+
+```{r}
+# first have to remove constant rows (i.e. zero reads across all samples)
+rawCounts <- rawCounts[rowSums(rawCounts[,1:ncol(rawCounts)]) > 0,]
+
+drawPCA <- function(counts, title, conditions, colors) {
+  # Transpose the counts matrix
+  counts_t <- t(counts[,1:ncol(counts)])
+
+  # Check for any constant columns
+  constantCols <- apply(counts_t, 2, function(x) var(x) == 0)
+
+  # Filter out constant columns
+  if(any(constantCols)) {
+    counts_t <- counts_t[, !constantCols]
+  }
+  
+  # Perform PCA
+  pcaResult <- prcomp(counts_t, center = TRUE, scale. = TRUE)
+  
+  # Create a data frame for plotting
+  pcaData <- data.frame(PC1 = pcaResult$x[,1], PC2 = pcaResult$x[,2], Condition = conditions)
+  
+  # Plot the first two principal components
+  ggplot(pcaData, aes(x = PC1, y = PC2, color = Condition)) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    ggtitle(title) +
+    xlab("Principal Component 1") +
+    ylab("Principal Component 2") +
+    scale_color_manual(values = colors)
+}
+
+conditions <- factor(c(rep("Control", 5), rep("Treatment", 5)))
+colors <- c("Control" = "#32a852", "Treatment" = "#a83288")
+
+drawPCA(rawCounts, "PCA of Control vs. Treatment (Raw)", conditions, colors)
+```
+
+Well that doesn't look great... there's no clear clustering of the samples by condition, and both PC1 and PC2 closely group 6 of the samples together. It's possible we have some strong batch effects going on here, let's see if trying to correct for them helps.
+
+```{r}
+# Using limma's removeBatchEffect function to correct for batch effects
+groups <- factor(c(rep("Control", 5), rep("Treatment", 5)))
+batch <- factor(c(1,1,1,2,2,1,1,1,2,2))
+
+batchRemoved <- removeBatchEffect(rawCounts[, 1:ncol(rawCounts)], batch = batch)
+
+drawPCA(batchRemoved, "PCA of Control vs. Treatment (Batch Corrected)", conditions, colors)
+```
+
+This looks more or less the same as before, just a bit more spread out.
+
+For now, going to proceed with normalization and check the PCA afterwards to see if it's sensible. In the meantime, we can check for outliers and see if correcting for these helps.
+
+### Were there any outliers in your dataset? How were they handled in the originating paper? How many outliers were removed?
+
+The authors don't make any mention of removing outliers in their methods section. It seems they just normalized with TPM.
+
+```{r}
+# Check for outlier genes
+geneCounts <- rowSums(rawCounts[,1:ncol(rawCounts)])
+summary(geneCounts)
+
+# plot the distribution of gene counts
+ggplot(data.frame(geneCounts = geneCounts), aes(x = geneCounts)) +
+  geom_histogram(binwidth = 100, fill = "lightblue", color = "black") +
+  theme_minimal() +
+  ggtitle("Distribution of Gene Counts") +
+  xlab("Gene Counts") +
+  ylab("Frequency")
+```
+
+Not unexpectedly, most genes have few reads and a small number have a very large number of reads (long right tail)
+
+Going to only plot genes above the mean so we can see the distribution of the genes with many reads a bit better.
+
+```{r}
+# Plot just the genes with counts above the mean
+ggplot(data.frame(geneCounts = geneCounts[geneCounts > mean(geneCounts)]), aes(x = geneCounts)) +
+  geom_histogram(binwidth = 100, color = "black") +
+  theme_minimal() +
+  ggtitle("Distribution of Gene Counts (Above Mean)") +
+  xlab("Gene Counts") +
+  ylab("Frequency")
+```
+
+Three genes there stand out to me, let's check what those are
+
+```{r}
+# Print the top 10 genes by count
+head(sort(geneCounts, decreasing = TRUE), 10)
+```
+
+MALAT1, ACTB, and RN7SK have a much greater count of reads than other gene. It's not entirely unexpected that actin and MALAT-1 have a large number of reads, as I've heard mention of these being common outliers in previous courses. I'm not sure about RN7SK, though. Due to their outlier status, they may significantly effect normalization. In order to decide whether to remove these genes, I want to: 1 - Check if they are differentially expressed between conditions 2 - Check if results are sensitive to their removal.
+
+## Normalization {#normalization}
+
+I'm choosing to use DESeq for normalization, because I know the median of ratios with geometric mean method is relatively robust to outliers, whereas TPM is more sensitive and RPKM/FPKM are not directly comparable across samples due to differences in library size (which is the case for my data).
+
+Moreover, DESeq is simple to use and widely accepted as a valid method for differential expression analysis.
+
+```{r}
+# First going to do normalization including the outliers
+
+dds <- DESeqDataSetFromMatrix(countData = rawCounts[,1:ncol(rawCounts)], colData = data.frame(condition = conditions), design = ~condition)
+dds <- estimateSizeFactors(dds)
+dds <- estimateDispersions(dds)
+dds <- DESeq(dds)
+results <- results(dds)
+
+results <- as.data.frame(results)
+```
+
+```{r}
+# Make a volcano plot
+plotVolcano <- function(resDF, title) {
+  resDF$significant <- ifelse(resDF$padj < 0.05, "Significant", "Not Significant")
+
+  # Remove NA values
+  print(paste0("Number of NA values removed: ", sum(is.na(resDF$padj))))
+  resDF <- resDF[!is.na(resDF$padj),]
+
+  # Create the volcano plot
+  p <- plot_ly(data = resDF, x = ~log2FoldChange, y = ~-log10(padj), color = ~significant, text =   ~row.names(resDF),
+               colors = c("Not Significant" = "grey", "Significant" = "red"), 
+               type = "scatter", mode = "markers") %>%
+    layout(title = title,
+           xaxis = list(title = "Log2 Fold Change"),
+           yaxis = list(title = "-Log10 Adjusted P-Value"),
+           hovermode = "closest")
+  return(p)
+}
+
+plotVolcano(results, title = "DE Genes (Outliers Included)")
+```
+
+```{r}
+# Now going to check if the top genes are differentially expressed
+outlierGenes <- c("MALAT1", "ACTB", "RN7SK")
+outlierResults <- results[rownames(results) %in% outlierGenes,]
+outlierResults$padj
+```
+
+For sure not diferentially expressed, but let's see how robust the analysis is to their presence:
+
+```{r}
+# Remove the top genes
+rawCountsOutliersRemoved <- rawCounts[!rownames(rawCounts) %in% outlierGenes,]
+ddsOutliersRemoved <- DESeqDataSetFromMatrix(countData = rawCountsOutliersRemoved[,1:ncol(rawCountsOutliersRemoved)], colData = data.frame(condition = conditions), design = ~condition)
+ddsOutliersRemoved <- DESeq(ddsOutliersRemoved)
+resultsOutliersRemoved <- results(ddsOutliersRemoved)
+
+resultsOutliersRemoved <- as.data.frame(resultsOutliersRemoved)
+resultsOutliersRemoved$symbol <- rawCounts$symbol[match(rownames(resultsOutliersRemoved), rownames(rawCounts))]
+# Make a volcano plot
+plotVolcano(resultsOutliersRemoved, title = "DE Genes (Outliers Removed)")
+```
+
+I don't see any difference in the results from the volcano plot, but just to be sure:
+
+```{r}
+# Calculate the correlation between the results
+temp <- merge(results, resultsOutliersRemoved, by = "row.names") # since some genes are removed
+cor(temp$log2FoldChange.x, temp$log2FoldChange.y)
+```
+
+Pearson correlation is 1, indicating outliers don't have really any effect on the results. This is somewhat expected since the geometric mean method used by DESeq is not sensitive to outliers.
+
+Going to proceed with the outliers included.
+
+```{r}
+# And now back to the PCA: 
+normCounts <- counts(dds, normalized = TRUE)
+
+drawPCA(normCounts, "PCA of Control vs. Treatment (Post Normalization)", conditions, colors)
+```
+
+This is suggesting to me there's some variability here that cannot be corrected by normalization on the read counts. On the flip side, this also says the normalization is not significantly biasing the results.
+
+Regardless, this is somewhat concerning for downstream analysis of differential gene expression. In the next assignment, I'd like to start by analyzing (i.e. with a heatmap) differences in expression between the 6 samples clustered together. I can also look more in depth at the dispersion of gene expression values across replicates (which is what DESeq does behind the scenes to construct a negative binomial model for gene expression).
+
+### What is the final coverage of your dataset?
+
+```{r}
+numReads <- sum(rawCounts)
+numReads
+# 520,345,550 reads 
+```
+
+I'm not sure it really makes sense to calculate 'coverage' in the traditional sense here. We're only able to capture RNA-seq reads, which are only the subset of the transcriptome comprising steady-state RNAs.
+
+One thing we could do, though, is estimate across all samples the average number of nucleotides we sequenced per protein-coding gene. This is going to be a very rough estimate because we have data including lncRNAs, which we've seen eat up a large portion of the reads (e.g. MALAT1).
+
+It's estimated about 1.5% of the genome is protein coding, and I'll assume the genome is 3.2 Gb.
+
+```{r}
+genomeSize <- 3.2e9
+pc <- 0.015
+readLength <- 50
+coverage <- numReads * readLength / (genomeSize * pc)
+coverage
+```
+
+About 542x, but this number is somewhat meaningless since we for sure didn't cover the entire transcriptome as some genes won't be expressed at all in NK cells, and lncRNA reads are included.
+
+## Update for NCBI beta standardized read counts
+
+```{r}
+
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts" 
+
+path <- paste(urld, "acc=GSE249240", "file=GSE249240_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&")
+
+# tbl <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames=1)
+
+# this gives an error, tried accessing it in my browser too but it seems the data is missing.
+```
+
+> **Missing samples:** Reasons for missing sample count data include the run didn't pass the 50% alignment rate or processing failed for a technical reason.
+
+It could be that here their pipeline failed due to the improper formatting I encountered earlier of the raw counts.
+
+```{r}
+save(rawCounts, file = "rawCounts.RData")
+save(dds, file = "dds.RData")
+```
+
+## References {#references}
+
+Groth, C., Maric, J., Garcés Lázaro, I., Hofman, T., Zhang, Z., Ni, Y., Keller, F., Seufert, I., Hofmann, M., Neumann-Haefelin, C., Sticht, C., Rippe, K., Urban, S., & Cerwenka, A. (2023). Hepatitis D infection induces IFN-β-mediated NK cell activation and TRAIL-dependent cytotoxicity. *Frontiers in Immunology*, *14*, 1287367. <https://doi.org/10.3389/fimmu.2023.1287367>
+
+Love, M. I., Huber, W., & Anders, S. (2014). Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology*, *15*(12), 550. <https://doi.org/10.1186/s13059-014-0550-8>
+
+Pagès H, Carlson M, Falcon S, Li N (2023). *AnnotationDbi: Manipulation of SQLite-based annotations in Bioconductor*. [doi:10.18129/B9.bioc.AnnotationDbi](https://doi.org/10.18129/B9.bioc.AnnotationDbi), R package version 1.64.1, <https://bioconductor.org/packages/AnnotationDbi>.
+
+Plotly Technologies Inc. Collaborative data science. Montréal, QC, 2015. <https://plot.ly.>
+
+Ritchie ME, Phipson B, Wu D, Hu Y, Law CW, Shi W, Smyth GK (2015). "limma powers differential expression analyses for RNA-sequencing and microarray studies." *Nucleic Acids Research*, **43**(7), e47. [doi:10.1093/nar/gkv007](https://doi.org/10.1093/nar/gkv007).
+
+Rainer J (2017). *EnsDb.Hsapiens.v75: Ensembl based annotation package*. R package version 2.99.0.
+
+Wickham, H., François, R., Henry, L., Müller, K., Vaughan, D., Software, P., & PBC. (2023). *dplyr: A Grammar of Data Manipulation* (1.1.4) [Computer software]. <https://cran.r-project.org/web/packages/dplyr/index.html>
+
+Wickham H (2016). *ggplot2: Elegant Graphics for Data Analysis*. Springer-Verlag New York. ISBN 978-3-319-24277-4, <https://ggplot2.tidyverse.org>.
