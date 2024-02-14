@@ -399,27 +399,29 @@ Regardless, this is somewhat concerning for downstream analysis of differential 
 
 ### What is the final coverage of your dataset?
 
+We initially had 57,280 identifiers, 10 samples
 ```{r}
-numReads <- sum(rawCounts)
-numReads
-# 520,345,550 reads 
+sum(rawCounts)
 ```
-
-I'm not sure it really makes sense to calculate 'coverage' in the traditional sense here. We're only able to capture RNA-seq reads, which are only the subset of the transcriptome comprising steady-state RNAs.
-
-One thing we could do, though, is estimate across all samples the average number of nucleotides we sequenced per protein-coding gene. This is going to be a very rough estimate because we have data including lncRNAs, which we've seen eat up a large portion of the reads (e.g. MALAT1).
-
-It's estimated about 1.5% of the genome is protein coding, and I'll assume the genome is 3.2 Gb.
-
+and 520,345,550 reads, for a coverage of:
 ```{r}
-genomeSize <- 3.2e9
-pc <- 0.015
-readLength <- 50
-coverage <- numReads * readLength / (genomeSize * pc)
-coverage
+reads <- 520345550
+symbols <- 57280
+samples <- 10
+print(reads / (symbols * samples))
 ```
+around 908x
 
-About 542x, but this number is somewhat meaningless since we for sure didn't cover the entire transcriptome as some genes won't be expressed at all in NK cells, and lncRNA reads are included.
+After normalization (and removing genes with 0 reads across all samples), we have:
+```{r}
+counts <- sum(normCounts)
+
+dim(normCounts)
+symbols <- 44194
+
+print(counts / (symbols * samples))
+```
+now about 1165x. 
 
 ## Update for NCBI beta standardized read counts
 

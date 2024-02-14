@@ -1,2 +1,3 @@
 GSE249240_raw.tar
-A1/GSE249240_extracted/
+GSE249240_extracted/
+*.RData
