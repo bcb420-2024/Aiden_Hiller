@@ -1,0 +1,756 @@
+---
+title: "BCB420 A2"
+author: "Aiden Hiller"
+engine: knitr
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+## Table of Contents
+
+1.  [Introduction](#introduction)
+2.  [Differential Expression
+    Analysis](#differential-expression-analysis)
+3.  [Overrepresentation Analysis
+    (ORA)](#overrepresentation-analysis-ora)
+4.  [Conclusions and Interpretation](#conclusions-and-interpretation)
+5.  [Appendix](#appendix)
+6.  [References](#references)
+
+```{r setup, error=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(ComplexHeatmap)
+library(gprofiler2)
+library(plotly)
+library(viridis)
+
+# Load in the normalized gene set from assignment 1:
+load('dds.RData')
+normalizedCounts <- counts(dds, normalized=TRUE)
+```
+
+## Introduction {#introduction}
+
+Data were retrieved from GEO under accession GSE249240. These expression
+values were retrieved from human natural killer (NK) cells co-cultured
+with human hepatocytes (HepG2) overexpressing the NTCP receptor. There
+are 5 replicates of each experimental condition; in the control
+condition, the hepatocytes were infected with hepatitis beta virus
+(HBV). In the experimental condition, they were infected with both HBV
+and hepatitis delta virus (HDV).
+
+Ensembl IDs were mapped to HUGO gene symbols using AnnotationDbi.
+Non-unique IDs (i.e. symbols with multiple IDs mapping to them) were
+retained without merging read counts in the event alternative splice
+isoforms are differentially expressed. Counts were normalized using
+DESeq's median of ratios method. While several genes (ACTB, MALAT1,
+RN7SK) were detected at much greater counts than others (40-48k reads vs
+25k reads for next highest expression), the median of ratios method is
+robust to the presence of outliers as their exclusion did not effect the
+results.
+
+Notably, there was a large degree of variability post-normalization that
+was not due to differences in experimental conditions. 6 of the
+replicates, 3 from the experimental condition and 3 from the control,
+were clustered together on a PCA of normalized read counts. By contrast,
+the other 4 replicates were more clearly delineated by their
+experimental condition.
+
+## Differential Expression Analysis {#differential-expression-analysis}
+
+DESeq has already computed significance data for me, but for extra
+transparency and practice, I will do this manually. Doing this also has
+the benefit that I can change the parameters and see how it affects the
+results. For now, though, I'm going to stick to the widely-accepted
+log2FoldChange \> 1 and adjusted p-value \< 0.05. Although I have reason
+to suspect there may many false positives and/or negatives due to the
+observed variability not owing to experimental conditions, I don't know
+what's causing it. I can revisit this later and adjust my thresholds
+accordingly.
+
+```{r}
+rowTtest <- function(row) {
+  conditionA <- row[grepl("^.*neg.*$", names(row))]
+  conditionB <- row[grepl("^.*pos.*$", names(row))]
+  ttest <- t.test(conditionA, conditionB)$p.value
+}
+
+# Apply the t-test to each row of the normalized counts:
+pvals <- apply(normalizedCounts, 1, rowTtest)
+
+# Correct for multiple testing:
+pvalsAdj <- p.adjust(pvals, method="BH")
+
+sigTested <- cbind(normalizedCounts, pvals, pvalsAdj)
+
+# Filter for significant genes:
+sigTested <- as.data.frame(sigTested)
+sigGenes <- sigTested[sigTested$pvalsAdj < 0.05, ]
+print(dim(sigGenes))
+```
+
+Interestingly, when I do a standard t-test with BH correction, there
+isn't a single gene that's significant (p_adj \< 0.05). I'm not sure if
+this is due to the normalization method. In assignment 1, I just used
+the p-values computed by DESeq, which after doing a bit of research
+appears to use a different type of hypothesis test (Wald test). I'm
+curious what would happen if I change the replicate labels to the ones I
+suspect have batch effects.
+
+### Figure 1:
+
+```{r}
+# Function from assignment 1:
+drawPCA <- function(counts, title, conditions, colors) {
+  # Transpose the counts matrix
+  counts_t <- t(counts[,1:ncol(counts)])
+
+  # Get column titles (assuming they are the names of the counts matrix)
+  columnTitles <- colnames(counts)
+
+  # Check for any constant columns
+  constantCols <- apply(counts_t, 2, function(x) var(x) == 0)
+
+  # Filter out constant columns
+  if(any(constantCols)) {
+    counts_t <- counts_t[, !constantCols]
+    columnTitles <- columnTitles[!constantCols]  # Also filter out titles for constant columns
+  }
+  
+  # Perform PCA
+  pcaResult <- prcomp(counts_t, center = TRUE, scale. = TRUE)
+  
+  # Create a data frame for plotting
+  pcaData <- data.frame(PC1 = pcaResult$x[,1], PC2 = pcaResult$x[,2], Condition = conditions, Title = columnTitles)
+  
+  # Plot the first two principal components
+  p <- ggplot(pcaData, aes(x = PC1, y = PC2, color = Condition)) +
+    geom_point(size = 3) +
+    #geom_text(aes(label = Title), vjust = -1, hjust = -0.05, size = 3) +
+    theme_minimal() +
+    ggtitle(title) +
+    xlab("Principal Component 1") +
+    ylab("Principal Component 2") +
+    scale_color_manual(values = colors)
+  
+  return(p)
+}
+
+
+conditions <- factor(c(rep("Control", 5), rep("Treatment", 5)))
+colors <- c("Control" = "#32a852", "Treatment" = "#a83288")
+p <- drawPCA(normalizedCounts[,1:10], "PCA of Normalized Read Counts", conditions, colors)
+p
+```
+
+**Figure 1**: PCA of median-of-ratios normalized read counts. Samples
+are highlighted by color based on their inclusion in either the control
+or treatment groups. Notably, controls 1,2,3 and treatment 1,2,3 cluster
+together, suggesting the variance in their values are more similar to
+one another then they are to the other samples. In the previous
+assignment, these effects could not be corrected by limma's batch
+correction function.
+
+positive 833, 049, and 073 cluster with negative 833, 049, and 073. That
+makes it easy:
+
+```{r}
+rowTtest_modified <- function(row) {
+  conditionA <- row[grepl("^.*833|049|073.*$", names(row))]
+  conditionB <- row[grepl("^.*938|935*$", names(row))]
+  ttest <- t.test(conditionA, conditionB)$p.value
+}
+
+pvals_test <- apply(normalizedCounts, 1, rowTtest_modified)
+padj <- p.adjust(pvals_test, method = "BH")
+batch_affected <- cbind(normalizedCounts, pvals_test, padj)
+batch_affected <- as.data.frame(batch_affected)
+sigGenes_test <- batch_affected[batch_affected$padj < 0.05, ]
+print(dim(sigGenes_test))
+```
+
+3848 significant genes... and these aren't the real labels.
+
+```{r}
+# Function to extract the gene names from the row names
+getSigGenes <- function(allGenes, polarity = "") {
+  # Select significant genes
+  sigGenes <- allGenes[allGenes$padj < 0.05, ]
+  if (polarity == "up") {
+    sigGenes <- sigGenes[sigGenes$log2FoldChange > 0, ]
+  }
+  else if (polarity == "down") {
+    sigGenes <- sigGenes[sigGenes$log2FoldChange < 0, ]
+  }
+    
+  # Remove version numbers
+  cleanedNames <- gsub("\\..*", "", rownames(sigGenes))
+  cleanedNames <- unique(cleanedNames)
+    
+  # Remove NAs (ensembl IDs that didn't map to any HUGO symbol)
+  cleanedNames <- cleanedNames[!is.na(cleanedNames)]
+  return(cleanedNames)
+}
+
+cleanedNames_batch <- getSigGenes(sigGenes_test)
+length(cleanedNames_batch)
+```
+
+Ok, after removing duplicates and NAs (ensembl IDs didn't map to any
+HUGO symbols?) we're at 1603 genes.
+
+To continue the assignment, I'm going to use the significant genes
+determined by the DESeq method. I'll also simultaneously perform
+overrepresentation analysis for the significant genes I retrieved from
+the 'batch-affected' vs 'non-batch-affected' differential expression.
+
+### Figure 2: Differentially-expressed Genes, Experimental Labels Volcano Plot
+
+```{r}
+results <- results(dds)
+results <- as.data.frame(results)
+
+# Function from previous assignment
+plotVolcano <- function(resDF, title) {
+  resDF$significant <- ifelse(resDF$padj < 0.05, "Significant", "Not Significant")
+
+  # Remove NA values
+  print(paste0("Number of NA values removed: ", sum(is.na(resDF$padj))))
+  resDF <- resDF[!is.na(resDF$padj),]
+
+  # Create the volcano plot
+  p <- plot_ly(data = resDF, x = ~log2FoldChange, y = ~-log10(padj), color = ~significant, text =   ~row.names(resDF),
+               colors = c("Not Significant" = "grey", "Significant" = "red"), 
+               type = "scatter", mode = "markers") %>%
+    layout(title = title,
+           xaxis = list(title = "Log2 Fold Change"),
+           yaxis = list(title = "-Log10 Adjusted P-Value"),
+           hovermode = "closest")
+  return(p)
+}
+
+p2 <- plotVolcano(results, title = "DE Genes (Real Labels)")
+p2
+```
+
+**Figure 2**: Volcano plot of significant differentially expressed genes
+across experimental conditions (experimental / control). Plot was
+generated using normalization and significance testing methods of
+DESeq2. Genes upregulated in the experimental replicates are given
+positive fold change values, genes downregulated have negative values.
+The results are largely in agreement with the authors' original
+publication, as many of the genes they highlighted are present here.
+These include *IFIT1*, *IFIT3*, and *IFIT5*, all of which are involved
+in interferon response and viral RNA sensing. Also present are *MX2*,
+*ZCCHC2*, and *SAMD9* which are also implicated in the antiviral
+response. Interestingly, there is one gene that is highly significant
+and also has a very high positive fold change value, C1ORF173. It's
+unclear whether this was present in the original analysis as the authors
+only highlighted a few genes of interest on their figure and did not
+provide the data for the rest of the significant genes. C1ORF173 has an
+adjusted p-value of 1.921e-31, which is 4 orders of magnitude greater
+than the next most significant gene, MX2. This gene was recently given a
+name, *ERICH3*, but its function is largely unknown. According to GTEx,
+it is most highly expressed in the brain, and in this vein was recently
+determined via GWAS to be a key predictor for SSRI treatment outcomes.
+However, it also seems to be expressed in lymphocytes, but it doesn't
+have any known function in that context.
+
+```{r}
+# significant genes prior to multiple testing correction:
+print(paste0("Significant genes before testing correction: ", count(results[results$pvalue < 0.05, ])))
+
+# significant genes after multiple testing correction:
+postCorrection <- !is.na(results$padj) & results$padj < 0.05
+print(paste0("Significant genes after testing correction: ", count(results[postCorrection, ])))
+```
+
+### Figure 3:
+
+```{r}
+# Heatmap
+plotHeatmap <- function(resDF, title) {
+  # Get significant genes
+  sigGenes <- resDF[resDF$padj < 0.05, ]
+  
+  # Get the normalized counts for the significant genes
+  sigCounts <- normalizedCounts[rownames(normalizedCounts) %in% rownames(sigGenes), ]
+
+  # Calculate the z-score
+  sigCounts <- t(scale(t(sigCounts)))
+  
+  # rename columns
+  colnames(sigCounts) <- c("Control 1", "Control 2", "Control 3", "Control 4", "Control 5", "Treatment 1", "Treatment 2", "Treatment 3", "Treatment 4", "Treatment 5")
+
+  # Create the heatmap
+  p <- Heatmap(sigCounts, name = title, col = viridis(10), show_row_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_column_names = TRUE)
+  return(p)
+}
+
+p3 <- plotHeatmap(results, 'Z-score')
+p3
+```
+
+**Figure 3**: Heatmap plotting z-scores for significant genes (padj \<
+0.05) across the 5 replicates for each condition with hierarchical
+clustering of both rows and columns. The conditions do cluster together,
+but it should be noted that treatments 1, 2, 3 and controls 1, 2, 3 have
+more similar responses to one another than they do to the other 2
+replicates in their respective groups. These are the exact 'batch'
+groupings.
+
+The groups do cluster together as expected, although it should maybe be
+noted that even within the differentially expressed genes the same 3
+replicates for the controls and the 3 for the treatment cluster more
+closely with each other than they do with the other 2 replicates in
+their respective groups.
+
+### Figure 4:
+
+```{r}
+# compute log2fc for the batch groupings
+# Assuming normalizedCounts is a matrix or data frame with numeric values
+batch_affected$log2FoldChange <- rowMeans(log2(batch_affected[, c(1:3, 6:8)] + 1)) - 
+                               rowMeans(log2(batch_affected[, c(4:5, 9:10)] + 1))
+
+
+p4 <- plotVolcano(batch_affected, "Batch Groupings")
+p4
+```
+
+**Figure 4**: Volcano plot for the "batch groupings." Note the
+differences in axes for this plot: p-values scale from 0 to 5 compared
+with previous volcano plot where they range from 0 to \~30. There are
+fewer highly significant genes but a greater number of total significant
+genes. Most strongly downregulated genes in the batch-affected cluster
+are **MYO10**, an unconventional myosin protein, **RBM24**, a generic
+RNA-binding protein involved in many roles including splicing,
+differentiation, mRNA translation and stability, etc... and **SBK2**
+which is believed to be involved in protein phosphorylation. Upregulated
+genes include RP11-673E1.1, a gene of unknown function, **SMC4** which
+is involved in chromosome condensation, and **POLA2**, a component of
+DNA polymerase.
+
+### Figure 5:
+
+```{r}
+# Also do the same for the batch groupings
+p5 <- plotHeatmap(batch_affected, 'Z-score')
+p5
+```
+
+**Figure 5**: Heatmap for "batch groupings" plotting z-scores of
+significant genes across the 2 conditions, with hierarchical clustering
+of genes (rows) and replicates (columns). Immediately I notice that
+control 4 and treatment 4 have almost identical responses. To me, the
+responses generally look more consistent with these groupings than the
+actual experimental ones.
+
+## Overrepresentation Analysis (ORA) {#overrepresentation-analysis-ora}
+
+For this, I'm going to stick with using g:profiler for ORA, as it is
+intuitive and I'm already familiar with how to interpret its plots. In
+the paper, they do a thresholded analysis with KEGG pathways, so I'll
+compare my results to theirs, but I'd also like to test with some other
+databases. Particularly, I'd like to look at reactome, since it seems
+they have fairly fleshed-out annotations for immune system pathways,
+which is primarily what I'm interested in.
+
+```{r}
+
+# function for calling gprofiler - this doesn't work for some reason?
+# The g:Profiler web resource you're trying to connect to is not available at the moment or has changed.
+# Please check your internet connection or try again later, or contact us on biit.support@ut.ee
+# NULL
+# Gprofile <- function(genes, DBs, threshold = 0.05, minSetSize, maxSetSize) {
+#   gp <- gprofiler2::gost(query = genes, sources = DBs, user_threshold = threshold, significant = TRUE, correction_method = "fdr")$result
+#   gp <- subset(gp, term_size >= minSetSize & term_size <= maxSetSize)
+#   return(gp)
+# }
+# Works fine when I call it outside the function
+
+# Real Labels, both up and downregulated
+realLabels <- getSigGenes(results) # Have to remove genes with multiple ensembl
+# IDs, since I can't use them for ORA with g:profiler. 
+
+DBs <- c("REAC", "KEGG")
+# real_labels_profile <- Gprofile(realLabels, DBs, minSetSize = 5 , maxSetSize = 500)
+real_labels_profile <- gprofiler2::gost(query = realLabels, sources = DBs, correction_method = "fdr")$result
+
+# and the same for the batch genes
+batch_profile <- gprofiler2::gost(query = cleanedNames_batch, sources = DBs, correction_method = "fdr")$result
+```
+
+```{r}
+# and then we also want to separately test the up and downregulated genes for 
+# each:
+batch_up <- getSigGenes(batch_affected, polarity = "up")
+batch_down <- getSigGenes(batch_affected, polarity = "down")
+batch_up <- gprofiler2::gost(query = batch_up, sources = DBs, correction_method = "fdr")$result
+batch_down <- gprofiler2::gost(query = batch_down, sources = DBs, correction_method = "fdr")$result
+
+
+real_up <- getSigGenes(results, polarity = "up")
+real_down <- getSigGenes(results, polarity = "down")
+real_up <- gprofiler2::gost(query = real_up, sources = DBs, correction_method = "fdr")$result
+real_down <- gprofiler2::gost(query = real_down, sources = DBs, correction_method = "fdr")$result
+
+# Upregulated: log2FC experimental / control > 0 OR batch_cluster / others > 0
+# Downregulated: vice versa
+```
+
+The batch cluster downregulated genes did not return any significant
+functional pathways.
+
+Now plotting all this data:
+
+### Figure 6:
+
+```{r}
+# I'd like to do a heatmap that includes for all significant KEGG pathways how
+# the significance level changed when it was tested in its respective class vs
+ORA_heatmap <- function(profiles_list, quant = 0.15, min_size = 10, max_size = 500, title = "Pathway Analysis") {
+  # Helper function to filter annotations by term size and then extract top quant% most significant p-values
+  filter_annotations <- function(profile) {
+    # First, filter by term size
+    size_filtered <- profile[profile$term_size >= min_size & profile$term_size <= max_size, ]
+    
+    # Then, calculate quantile on the size-filtered data
+    if (nrow(size_filtered) > 0) {
+      threshold <- quantile(size_filtered$p_value, quant) # Get the top quant percent pathways
+      significant_filtered <- size_filtered[size_filtered$p_value <= threshold, ]
+      return(significant_filtered)
+    } else {
+      return(data.frame(term_name = character(), p_value = numeric(), stringsAsFactors = FALSE))
+    }
+  }
+  
+  both_filtered <- filter_annotations(profiles_list$both)
+  up_filtered <- filter_annotations(profiles_list$up)
+  down_filtered <- filter_annotations(profiles_list$down)
+  
+  combined_annotations <- unique(c(both_filtered$term_name, up_filtered$term_name, down_filtered$term_name))
+  
+  pval_matrix <- matrix(NA, nrow = length(combined_annotations), ncol = 3, 
+                        dimnames = list(combined_annotations, c("Both", "Up", "Down")))
+  
+  for (i in seq_along(combined_annotations)) {
+    annotation <- combined_annotations[i]
+    
+    if (annotation %in% both_filtered$term_name) {
+      pval_matrix[i, 1] <- -log10(min(both_filtered$p_value[both_filtered$term_name == annotation] + 1e-100))
+    }
+    
+    if (annotation %in% up_filtered$term_name) {
+      pval_matrix[i, 2] <- -log10(min(up_filtered$p_value[up_filtered$term_name == annotation] + 1e-100))
+    }
+    
+    if (annotation %in% down_filtered$term_name) {
+      pval_matrix[i, 3] <- -log10(min(down_filtered$p_value[down_filtered$term_name == annotation] + 1e-100))
+    }
+  }
+  
+  p <- Heatmap(pval_matrix, col = viridis::magma(10), name = "-log10(pval)",
+               show_row_names = TRUE, cluster_rows = FALSE, 
+               cluster_columns = FALSE, show_column_names = TRUE,
+               rect_gp = gpar(col= "white"),
+               column_title = title,
+               row_title = "Pathway")
+  
+  draw(p, heatmap_legend_side = "left")
+}
+
+# Assuming profiles_list is defined and contains the profiles 'both', 'up', and 'down'
+real_profiles_list <- list(both = real_labels_profile, up = real_up, down = real_down)
+
+# Call the function with the new parameters for term size filtering and quantile calculation
+p6 <- ORA_heatmap(real_profiles_list, quant = 0.30, min_size = 5, max_size = 500, title = "Top 30% of Significant Pathways: Actual Labels")
+```
+
+**Figure 6**: Heatmap showing the top 30% by adjusted p-value (to avoid
+overplotting) of significant pathways for the experimental groupings.
+Pathways are size-filtered for between 5 and 500 terms. g:profiler
+results when using a query set of both upregulated and downregulated
+genes, only upregulated genes, and only downregulated genes are shown.
+Adjusted p-values are plotted on a -log10 scale. Results for all
+significant genes are similar to the query for only upregulated genes,
+though some terms nearer to the threshold in the upregulated-only query
+don't appear in aggregate (i.e. Necroptosis, OAS antiviral response).
+The aggregated query also has less significant values when compared to
+the upregulated query. For the downregulated query, none of the
+significant terms appear in aggregate (cap-dependent translation
+initiation, GTP hydrolysis, etc...). The authors performed KEGG pathway
+analysis (supplementary figure 3B), but didn't list any of the
+significant terms. They instead show a figure for the KEGG Natural
+killer cell mediated cytotoxicity pathway and plot upregulated and
+downregulated genes in this pathway but don't give the p-value. I'm
+doubtful as to whether the pathway was actually significant, since I
+didn't recover this. It's interesting that my most significant pathways
+seem to be generic RNA virus response, since both conditions should have
+a viral response. I'm surprised the genes involved are so strongly
+upregulated in the experimental condition (HDV + HBV) vs just HBV. I
+also think pathway analysis probably loses some of the fine-grained
+details necessary to discern how the response to HBV alone differs from
+HBV and HDV. For that, you might need to have a specific hypothesis
+about the genes involved.
+
+### Figure 7:
+
+```{r}
+batch_down <- data.frame(batch_down) # bc it was NULL
+batch_profiles_list <- list(both = batch_profile, up = batch_up, 
+                            down = batch_down)
+p7 <- ORA_heatmap(batch_profiles_list, quant = 0.15, min_size = 5, max_size = 500, title = "Top 15% of Significant Pathways: Batch Groupings")
+```
+
+**Figure 7**: (This doesn't display properly on my screen, might need to
+open in new window) Over-representation analysis heatmap of 'batch
+grouping' labels. Top 15% of pathways by adjusted p-value are shown.
+Pathways are size filtered for those with between 5 and 500 terms.
+g:profiler results for both upregulated and downregulated genes, only
+upregulated genes, and only downregulated genes are shown. The
+downregulated gene pathway analysis did not return any significant
+pathways. Signal from upregulated genes alone is stronger than in
+aggregate, and some significant pathways only appear when upregulated
+genes are queried alone. Most of the pathways are cell-cycle related,
+and include genes implicated in driving S phase (DNA synthesis) and DNA
+repair. Also present are pathways involved in M phase, including
+chromosome condensation and mitotic spindle formation. This suggests the
+6 cross-condition clustered replicates from the PCA are upregulated for
+genes associated with cell division and DNA repair, while the other 4
+are depleted for this activity.
+
+## Conclusions and Interpretation {#conclusions-and-interpretation}
+
+1.  Calculate p-values for each of the genes in your expression set. How
+    many genes were significantly differentially expressed? What
+    thresholds did you use and why?
+
+    In the previous assignment, I discovered a large degree of
+    variability in the authors' dataset that could not be explained by
+    the experimental conditions. Namely, 3 replicates from the control
+    condition and 3 replicates from the experimental condition clustered
+    together, and separately from the rest of the data, on a PCA. This
+    variability could not be corrected by normalization, nor by
+    functions aimed at correcting common sources of batch effects. To
+    further investigate this, I decided to test both the actual labels
+    and what I refer to as 'batch groupings' (the 6 cross-condition
+    replicates clustering together vs. the 4 others) for differential
+    expression. I attempted to use a simple t-test with a threshold of p
+    \< 0.05 for significance testing. I am aware DESeq automatically
+    computes significance using a different hypothesis test (the Wald
+    test), but I did this out of curiosity for how the results might
+    differ. However, for the actual experimental groups, this method
+    recovered 0 significant genes. On the other hand, there were 1603
+    for the batch groupings (after multiple testing correction). This
+    was somewhat alarming to me; in the previous assignment DESeq had
+    found many significant genes, and I'm not sure why changing the
+    significance testing method had such a profound effect on the
+    results. In order to continue with the analysis, I decided to use
+    the DESeq results for the actual groupings. I stuck with the t-test
+    results for the batch ones, though.
+
+```{r}
+print(paste0("Significant genes before testing correction: ", count(results[results$pvalue < 0.05, ])))
+```
+
+2.  Multiple hypothesis testing - correct your p-values using a multiple
+    hypothesis correction method. Which method did you use? And Why? How
+    many genes passed correction?
+
+    I used Benjamini-Hochberg (or FDR) since its widely-accepted and
+    known to be less stringent than Bonferroni.
+
+```{r}
+postCorrection <- !is.na(results$padj) & results$padj < 0.05
+print(paste0("Significant genes after testing correction: ", count(results[postCorrection, ])))
+```
+
+3.  Show the amount of differentially expressed genes using an MA Plot
+    or a Volcano plot. Highlight genes of interest.
+
+    See figures 2 and 4 (and their captions).
+
+4.  Visualize your top hits using a heatmap. Do you conditions cluster
+    together? Explain why or why not.
+
+    See figures 3 and 5
+
+**ORA Section**
+
+1.  Which method did you choose and why?
+
+I decided to use g:profiler for its ease-of-use with a FDR-corrected
+significance threshold. g:profiler uses a simple one-sided Fisher's test
+for computing thresholded overrepresentation analysis, and also enables
+the user to query many databases simultaneously.
+
+2.  What annotation data did you use and why? What version of the
+    annotation are you using?
+
+I used KEGG since the authors tested their results for KEGG pathways and
+wanted to compare my results. I also tested against reactome since I
+like their web interface and wanted to compare how the pathways might
+differ from KEGG.
+
+KEGG version: 2024-01-22 Reactome version: 2024-1-25
+
+3.  How many genesets were returned with what thresholds?
+
+```{r}
+print(paste0("Number of sig. pathways (KEGG + Reactome), real labels: ", nrow(real_labels_profile)))
+
+print(paste0("Number of sig. pathways (KEGG + Reactome), batch groupings ", nrow(batch_profile)))
+```
+
+I used FDR-corrected p-value \< 0.05, no thresholds on the term size or
+overlap requirements.
+
+4.  Run the analysis using the up-regulated set of genes, and the
+    down-regulated set of genes separately. How do these results compare
+    to using the whole list (i.e all differentially expressed genes
+    together vs. the up-regulated and down regulated differentially
+    expressed genes separately)?
+
+See figures 6 and 7
+
+**Interpretation**
+
+1.  Do the over-representation results support conclusions or mechanism
+    discussed in the original paper?
+
+Yes, the results largely agree with the sentiment in the original paper
+that the primary difference between the conditions is an upregulation of
+interferon-mediated response to viral RNA in the experimental condition
+versus the control condition. This is not that surprising of a result
+since both HDV and HBV are RNA viruses. However, I was surprised to see
+that the upregulation was so strong given that this sort of response
+should be present in both conditions. Also of note, and which the
+authors either didn't find or left out of their analysis, was that genes
+involved in translation initiation and specifically 5' cap-dependent
+initiation are downregulated in the experimental condition. This is
+interesting since both HBV and HDV have 5' capped mRNAs, but it's
+unclear why the NK cells would be suppressing translation initiation in
+the presence of HBV but not HDV (Jong-Keon et al, 2000). I'm also
+interested in what the role of *ERICH3* (C1ORF173) might be in
+lymphocytes given it's high level of significance in my results. Little
+is known of its function, though it's been implicated in responsiveness
+to SSRI-mediated therapy via GWAS (Liu et al, 2021). However, this is an
+entirely different context and it likely has a role in lymphocytes
+distinct from its role in the brain.
+
+These results should also be taken with a grain of salt since they were
+sensitive to the method of significance testing used. Via a t-test with
+the same multiple testing correction method, there were no significant
+genes. I'm hesitant to make any conclusions about this since I'm unsure
+as to whether a t-test may be too stringent for median of
+ratios-normalized values. Using the Wald test instead (DESeq's method) I
+had better results, but at the same time I feel the results should be
+robust to this (or at least not this sensitive).
+
+In my testing of the batch groups, I determined there were many
+significant genes upregulated in 3 of the control replicates and 3 of
+the experimental replicates that were involved in the cell cycle and
+cell division. This seems to hint that the NK cells in these 6
+replicates were proliferating, while the others were not. My current
+hypothesis about this is that the cells within these replicates were
+actually responding to viral infection in the hepatocytes and thus were
+proliferating, while the others were not. It could be that the other 4
+replicates were not co-cultured for long enough to warrant a response or
+that somehow the signal did not reach the NK cells. Although we do not
+have any data on expression in the hepatocytes, it's likely they
+released cytokines in response to the viruses. It's well known that
+lymphocyte proliferation is driven by cytokine binding, such as
+TNF-alpha, at extracellular receptors (Khan et al, 2023). If 4 of the
+co-culture experiments didn't actually work, then it would be worth
+testing differential expression for just the 3 in each group that seem
+to have a response and evaluating how this might change the results.
+This could reveal some more nuances in the difference between NK-cell
+response to HDV-HBV co-infection as opposed to HBV alone, beyond just
+upregulation of interferon.
+
+2.  Can you find evidence, i.e. publications, to support some of the
+    results that you see. How does this evidence support your results.
+
+Yes: - Jong-Keon et al: HBV is a 5' capped virus - Alves et al: HDV's
+delta antigen mRNA is 5' capped NK cells have downregulated
+cap-dependent initiation in presence of hepatocytes co-infected with HBV
+and HDV as opposed to just HBV. I'm not sure what the biological
+interpretation for this might be, maybe as a precaution to infection NK
+cells downregulate expression of genes involved in cap-dependent
+initiation. However, the p-values are low relative to other pathways,
+and potentially changing the replicates used for differential expression
+would change these results.
+
+-   Liu et al: ERICH3 is a gene of largely unknown function. In the
+    brain it is implicated in SNRI treatment sensitivity.
+
+-   Khan et al: NK cell proliferation is driven by cytokine binding at
+    extracellular receptors.
+
+## Appendix {#appendix}
+
+Figures also provided here in case they don't render in the markdown.
+
+![Figure 1](/home/rstudio/projects/figures/Figure1.png) ![Figure
+2](/home/rstudio/projects/figures/Figure2.png)
+
+![Figure 3](/home/rstudio/projects/figures/Figure3.png) ![Figure
+4](/home/rstudio/projects/figures/Figure4.png)
+
+![Figure 5](/home/rstudio/projects/figures/Figure5.png) ![Figure
+6](/home/rstudio/projects/figures/Figure6.png) ![Figure
+7](/home/rstudio/projects/figures/Figure7.png)
+
+Note: for the interactive plots (figures 2 and 4) an html is provided
+that will open an interactive version in the web browser.
+
+## References {#references}
+
+1.  Jong-Keun, J., Gye-Soon, Y. & Wang-Shick, R. Evidence that the
+    5′-End Cap Structure Is Essential for Encapsidation of Hepatitis B
+    Virus Pregenomic RNA \| Journal of Virology. (2000).
+
+2.  Liu, D. et al. ERICH3: vesicular association and antidepressant
+    treatment response. Mol Psychiatry 26, 2415--2428 (2021).
+
+3.  Khan, A. U. H. et al. The TNFα/TNFR2 axis mediates natural killer
+    cell proliferation by promoting aerobic glycolysis. Cell Mol Immunol
+    20, 1140--1155 (2023).
+
+4.  Alves, C., Branco, C. & Cunha, C. Hepatitis Delta Virus: A Peculiar
+    Virus. Advances in Virology 2013, e560105 (2013).
+
+5.  Liis Kolberg, Uku Raudvere, Ivan Kuzmin, Priit Adler, Jaak Vilo,
+    Hedi Peterson: g:Profiler---interoperable web service for functional
+    enrichment analysis and gene identifier mapping (2023 update)
+    Nucleic Acids Research, May 2023; <doi:10.1093/nar/gkad347> [PDF].
+
+6.  Plotly Technologies Inc. Collaborative data science. Montréal,
+    QC, 2015. <https://plot.ly>.
+
+7.  Wickham, H. et al. ggplot2: Create Elegant Data Visualisations Using
+    the Grammar of Graphics. (2024).
+
+8.  Kolberg, L. & Raudvere, U. gprofiler2: Interface to the 'g:Profiler'
+    Toolset. (2024).
+
+9.  Love MI, Huber W, Anders S (2014). "Moderated estimation of fold
+    change and dispersion for RNA-seq data with DESeq2." Genome Biology,
+    15, 550. <doi:10.1186/s13059-014-0550-8>.
+
+10. Gu Z, Eils R, Schlesner M (2016). "Complex heatmaps reveal patterns
+    and correlations in multidimensional genomic data." Bioinformatics.
+    <doi:10.1093/bioinformatics/btw313>.
+
+11. Wickham, H. et al. dplyr: A Grammar of Data Manipulation. (2023).
+
+12. Müller, K., Wickham, H., Francois, R., Bryan, J. & RStudio. tibble:
+    Simple Data Frames. (2023).
+
+13. Garnier, S. et al. viridis: Colorblind-Friendly Color Maps for R.
+    (2024).

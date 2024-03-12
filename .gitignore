@@ -1,3 +1,6 @@
 GSE249240_raw.tar
 GSE249240_extracted/
-*.RData
+name_of_html.html
+processing_output_filename
+quiz/
+.Rhistory
