@@ -1,0 +1,56 @@
+---
+title: "BCB420 Assignment 3"
+author: "Aiden Hiller"
+bibliography: references.bib
+output:
+    html_document:
+        toc: true
+        toc_float: false
+        number_sections: true
+---
+
+# Introduction
+
+The raw data in this assignment are sourced from Groth et al, 2023 [@Groth2023]. In this study, the authors co-cultured human natural killer (NK) cells with hepatocytes overexpressing the receptor for Hepatitis delta and beta viruses. The hepatocytes were infected with either hepatitis beta virus alone (control), or hepatitis beta and hepatitis delta virus (experimental). NK cells were co-cultured in the presence of infected hepatocytes for 48 hours and sequenced. These data are accessible on GEO under accession [GSE249240](#0).
+
+Previously (see assignments 1 & 2), the data were mapped to HUGO symbols, then normalized and assessed for significance using DESeq2 [@loveModeratedEstimationFold2014]. The significant differentially-expressed genes across control and experimental conditions were used to perform an overrepresentation analysis (ORA) using g:profiler [@Kolberg2023] on the KEGG pathways and reactome gene sets. Gene sets were size-thresholded for those between 5 and 500 terms. The most significantly upregulated sets (in the experimental condition) included interferon signalling, interferon alpha/beta signalling, and pathways associated with a number of RNA viruses (i.e. COVID-19, Influenza A, Measles). Downregulated pathways included cap-dependent translation initiation.
+
+These results largely agreed with the conclusions of the original paper. However, interestingly, I noticed six of the author's replicates, 3 experimental and 3 control, were not easily distinguishable by experimental condition and clustered separately from the rest of the replicates on a PCA. These observations persisted after normalizing and attempting to correct for common batch effects. To further test this, I decided to use these 'batch' groupings for assessing significance and conducting ORA. This resulted in a number of significant pathways differentially regulated across the conditions. Most of these pathways had some role in the cell cycle, including S phase, G1/S transition, DNA replication, DNA strand elongation, etc...
+
+This indicated the 6 distinct replicates were actively undergoing cell division and proliferation, while the other 4 were significantly depleted for these genes. It could be the case that the cells in these replicates were proliferating in response to a viral infection in the hepatocytes, while, for whatever reason, the co-culturing experiment didn't result in an active response for the others.
+
+# Gene Set Enrichment Analysis
+
+First I'm going to retrieve the gene expression values from the previous assignment
+
+```{r}
+expData <- "/home/rstudio/projects/A2/dds.RData"
+load(expData)
+```
+Now, I'm going to perform GSEA using the original GSEA implementation from the Broad Institute. Going to use the Bader lab's gene sets 
+
+```{r}
+gseaPath <- "https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/gsea/software/desktop/4.3/GSEA_Linux_4.3.3.zip"
+
+# Path to jar file
+gseaJar <- "/home/rstudio/projects/GSEA/gsea-4.3.3.jar"
+
+if (!file.exists(gseaJar)) {
+    # Download GSEA
+    tryCatch({
+        download.file(gseaPath, destfile = "/home/rstudio/projects/GSEA/GSEA.zip")
+        unzip("/home/rstudio/projects/GSEA/GSEA.zip", exdir = "/home/rstudio/projects/GSEA/")
+        
+        # Move jar file
+        if (file.exists("/home/rstudio/projects/GSEA/gsea-4.3.3.jar")) {
+            file.rename("/home/rstudio/projects/GSEA/gsea-4.3.3.jar", gseaJar)
+        } else {
+            stop("The jar file does not exist in the expected location.")
+        }
+    }, error = function(e) {
+        cat("An error has occurred: ", e$message, "\n")
+    })
+}
+
+
+```
