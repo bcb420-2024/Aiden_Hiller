@@ -23,34 +23,270 @@ This indicated the 6 distinct replicates were actively undergoing cell division 
 
 First I'm going to retrieve the gene expression values from the previous assignment
 
-```{r}
+```{r setup, include=FALSE}
+require(DESeq2)
+require(GSA)
+require(viridis)
+require(ComplexHeatmap)
 expData <- "/home/rstudio/projects/A2/dds.RData"
 load(expData)
 ```
-Now, I'm going to perform GSEA using the original GSEA implementation from the Broad Institute. Going to use the Bader lab's gene sets 
+
+Now, I'm going to perform GSEA using the original GSEA implementation from the Broad Institute using the Bader Lab's gene sets:
 
 ```{r}
-gseaPath <- "https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/gsea/software/desktop/4.3/GSEA_Linux_4.3.3.zip"
+# Define the download URL
+gseaPath <- "https://github.com/bcb420-2024/Aiden_Hiller/raw/main/GSEA/GSEA_Linux_4.3.3.zip"
 
-# Path to jar file
-gseaJar <- "/home/rstudio/projects/GSEA/gsea-4.3.3.jar"
+# Desired destination path for the zip file
+destfile <- "/home/rstudio/projects/GSEA/GSEA_Linux_4.3.3.zip" 
 
-if (!file.exists(gseaJar)) {
-    # Download GSEA
-    tryCatch({
-        download.file(gseaPath, destfile = "/home/rstudio/projects/GSEA/GSEA.zip")
-        unzip("/home/rstudio/projects/GSEA/GSEA.zip", exdir = "/home/rstudio/projects/GSEA/")
-        
-        # Move jar file
-        if (file.exists("/home/rstudio/projects/GSEA/gsea-4.3.3.jar")) {
-            file.rename("/home/rstudio/projects/GSEA/gsea-4.3.3.jar", gseaJar)
-        } else {
-            stop("The jar file does not exist in the expected location.")
-        }
-    }, error = function(e) {
-        cat("An error has occurred: ", e$message, "\n")
-    })
+# Path to jar file (update this if GSEA is installed elsewhere)
+gseaCLI <- "/home/rstudio/projects/GSEA/GSEA_Linux_4.3.3/gsea-cli.sh"
+
+# Check if the file already exists
+if (!file.exists(destfile)) {
+  tryCatch({
+    download.file(gseaPath, destfile, mode = "wb", extra = getOption("download.file.extra"))
+    message("GSEA file downloaded successfully!")
+}, error = function(err) {
+  stop("Error downloading GSEA file: ", err$message)
+})
+} else {
+  message("GSEA file already exists. Skipping download.")
 }
 
+# Check if the GSEA cli is present
+if (!file.exists(gseaCLI)) {
+  # Unzip the file
+    unzip(destfile, exdir = "/home/rstudio/projects/GSEA/")
+
+    # Change the permissions on the cli
+    tryCatch({
+      system(paste("chmod +x", gseaCLI))
+      message("GSEA cli ready!")
+    }, error = function(err) {
+      stop("Error changing permissions on GSEA cli: ", err$message)
+    })
+} else {
+  message("GSEA cli already exists. Skipping download.")
+}
+```
+
+Going to use the Bader lab gene sets from March, no IEA. Trying out the new wikipathways OCR feature.
+
+```{r}
+BaderLabGeneSetsMarch2024_noIEA <- "http://download.baderlab.org/EM_Genesets/current_release/Human/symbol/Human_GO_AllPathways_withPFOCR_no_GO_iea_March_01_2024_symbol.gmt"
+destfile <- "/home/rstudio/projects/GSEA/Human_GO_AllPathways_withPFOCR_no_GO_iea_March_01_2024_symbol.gmt"
+
+# Check if the file already exists
+if (!file.exists(destfile)) {
+  tryCatch({
+    download.file(BaderLabGeneSetsMarch2024_noIEA, destfile, mode = "wb", extra = getOption("download.file.extra"))
+    message("Gene sets downloaded successfully!")
+}, error = function(err) {
+  stop("Error downloading Bader lab gene sets: ", err$message)
+})
+} else {
+  message("Gene sets already exist. Skipping download.")
+}
+```
+
+Now, I need to rank the DeSeq results. Most upregulated genes (by magnitude of fold-change) will be at the top of the list, while the most downregulated genes will occur at the bottom of the list.
+
+```{r}
+res <- results(dds)
+resOrdered <- res[order(-res$log2FoldChange),]
+
+# Extract the gene symbols and log2 fold changes
+rankedGenes <- data.frame(gene = rownames(resOrdered), log2FC = resOrdered$log2FoldChange)
+
+# Save the ranked genes to a file
+write.table(rankedGenes, 
+            file = "/home/rstudio/projects/GSEA/rankedGenes.rnk", 
+            sep = "\t", 
+            row.names = FALSE, 
+            col.names = FALSE,
+            quote = FALSE)
+```
+
+Prepare the arguments for the GSEA command
+
+```{r}
+rankedGenes <- "/home/rstudio/projects/GSEA/rankedGenes.rnk"
+geneSets <- "/home/rstudio/projects/GSEA/Human_GO_AllPathways_withPFOCR_no_GO_iea_March_01_2024_symbol.gmt"
+outputDir <- "/home/rstudio/projects/GSEA/GSEA_output"
+
+# To get this to work, I had to manually edit the shell script to allocate more ram to java
+# The default was 4G and it kept giving me an out of memory error even though I'm only doing 1000 permutations
+
+# It also took me about an hour to run on 8 gigs, in hindsight probably could've done it faster with a bit
+# more ram. 
+
+minSize <- 5
+maxSize <- 500
+
+analysis <- "HepDeltaNKCells"
+
+gseaCommand <- paste("", gseaCLI,
+                   "GSEAPreRanked -gmx", geneSets, 
+                   "-rnk" , rankedGenes, 
+                   "-collapse false -nperm 1000 -scoring_scheme weighted", 
+                   "-rpt_label ", analysis,
+                   "  -plot_top_x 20 -rnd_seed 12345  -set_max ", maxSize,  
+                   " -set_min ", minSize, "-zip_report false ",
+                   " -out" ,outputDir, 
+                   " > gsea_output.txt",sep=" ")
+
+system(gseaCommand)
 
 ```
+
+# Cytoscape
+
+Loaded the network with EnrichmentMap using a q-value \< 0.001 and edge similarity cutoff \< 0.375
+
+![Figure 1](/home/rstudio/projects/figures/preAnnotation.png)**Figure 1:** Raw EnrichmentMap (v 3.3.6) output on GSEA results using an FDR q-value cutoff of 0.001 and edge similarity cutoff of 0.375. Upregulated gene sets in the experimental condition are annotated in red, downregulated in blue. Results largely concur with those of the original paper as interferon signalling is significantly upregulated in the experimental condition. Interestingly, though, it seems many protein synthesis pathways are downregulated, something that wasn't originally mentioned.
+
+![Figure 2](/home/rstudio/projects/figures/EM.png)**Figure 2:** Manually-annotated and clustered enrichment map. Cutoff parameters left unchanged from above figure. Edges are bundled with parameters: handles = 3, spring constant = 0.03, compatibility threshold = 0.3, max iterations = 500.
+
+EM1 visual style was used for the visualization parameters, plus additional edge bundling.
+
+![Figure 3](/home/rstudio/projects/figures/AutoAnnotateEM.png) **Figure 3:** EnrichmentMap annotated with AutoAnnotate (v1.4.1) on gene set descriptions.
+
+# Results and Interpretation
+
+## GSEA Questions
+
+1.  What method did you use? What genesets did you use? Make sure to specify versions and cite your methods.
+
+    **A:** The original GSEA implementation (from Broad) and the Bader lab March 2024 gene sets, with Wikipathways OCR and GO biological pathways, but no electronic annotations.
+
+2.  Summarize your enrichment results.
+
+    **A:** The upregulated pathways are pretty unsurprising, most of them include interferon inducible genes with tetratricopeptide repeats (*IFIT* genes), which are among the most significant for differential expression. The WikiPathways OCR seems to have worked pretty well for me, as many of the top pathways (i.e. PMC6585752[@Hoffman2017] and PMC7057977 [@Maertens2020]) encompass interferon signalling and the viral response. Since it's such a well-studied pathway, though, there's a lot of redundancy here with viral response pathways published elsewhere in conventional sources. I also had to check individual papers to figure out what the actual pathway was since the title was often misleading.
+
+    The downregulated pathways include many pertaining to protein synthesis (initiation, elongation, and termination), amino acid metabolism, and cell cycle regulation.
+
+3.  How do these results compare to the results from the thresholded analysis in Assignment #2. Compare qualitatively. Is this a straight forward comparison? Why or why not?
+
+    **A:** On the surface, the results are quite similar, most likely because the interferon response is so prevalent. It's difficult to interpret the rest of the results, though, since many of the pathways pertain to particular viruses or other miscellaneous processes. The differences are most likely due to how each of the methods perform thresholding. With ORA, we are only looking at the most significant genes, whereas GSEA considers all genes regardless of significance and determines where the genes in a pathway tend to be distributed in the ranked list.
+
+## Cytoscape Questions
+
+1.  How many nodes and how many edges in the resulting map? What thresholds were used to create this map?
+
+    **A:** Nodes = 168, Edges = 1433. Thresholds: q-value \< 0.001 and edge similarity \< 0.375.
+
+2.  See figure 2
+
+3.  See figure 2
+
+4.  Collapse your network to a theme network. What are the major themes present in this analysis? Do they fit with the model? Are there any novel pathways or themes?
+
+    **A:** I'm not sure how to interpret some of the auto annotations ('cord term low' and 'highly significant rpe') but these clusters are from the Wikipathways OCR terms. They also don't add much that I didn't already know (i.e. main cellular response is interferon-induced). Also, I'm not sure why the downregulated pathways were all labelled with something so specific as selenocysteine synthesis since this cluster comprises pathways labelled with protein translation, initiation, elongation and termination.
+
+## Interpretation
+
+1.  Do the enrichment results support conclusions or mechanism discussed in the original paper? How do these results differ from the results you got from Assignment #2 thresholded methods
+
+    **A:** Comparing with the original paper, none of the top significant pathways include the gene they mention as their primary finding, TRAIL (or *TNFSF10*). Granted, it could be that this role for TNFSF10 is poorly understood, but it also doesn't appear in the ranked list until #5415: there are quite a few other genes with stronger differential expression across conditions. The specific pathway they mention in the publication `Natural Killer Cell Mediated Cytotoxicity` was not significant in my analysis (and I suspect it wasn't in theirs since they don't give a p-value). If there is a gene signature that differentiates a traditional RNA virus from a satellite virus (Hep Delta), then it probably wouldn't be captured in a pathway analysis, and thus the results are unsurprising.
+
+    Comparing the ORA and GSEA, the results are very similar. The names for pathways differ between the two but they're largely referring to the same thing, which are JAK-STAT signalling, IFIT and RSAD2 response to interferon, and antiviral response. The downregulated results also concur between the two, both make mention of translation initiation. Although, the GSEA generally picks up on more translation-related pathways.
+
+2.  Can you find evidence, i.e. publications, to support some of the results that you see. How does this evidence support your result?
+
+    There are many publications in support of the interferon-induced response (i.e [@Samuel2001]). The downregulated, translation initiation and elongation pathways are a bit trickier, though. I'm not sure if these are a consequence of issues in their experimental setup I picked up on earlier with the 'batch effects.' A plausible biological explanation, though, would be that this is a defense mechanism. The NK cells downregulate their own translation initiation to prevent viral protein synthesis. It's known that some pattern recognition receptors (PRRs) such as protein kinase R respond to dsRNA and phosphorylate initation factors, blocking translation ([@García2006], [@Bussiere2021]). In this case, the dsRNA might be a consequence of replication intermediates for deltavirus. This wouldn't affect transcription, but it demonstrates downregulation of translation initiation would be a desired response for the host cell in the presence of a virus.
+
+3.  Gene Dark Matter:
+
+```{r results='hide', message=FALSE, echo=FALSE}
+GMT <- "/home/rstudio/projects/GSEA/Human_GO_AllPathways_withPFOCR_no_GO_iea_March_01_2024_symbol.gmt"
+GMT <- GSA::GSA.read.gmt(GMT)
+
+negative <- "/home/rstudio/projects/GSEA/GSEA_output/HepDeltaNKCells.GseaPreranked.1711919061812/gsea_report_for_na_neg_1711919061812.tsv"
+positive <- "/home/rstudio/projects/GSEA/GSEA_output/HepDeltaNKCells.GseaPreranked.1711919061812/gsea_report_for_na_pos_1711919061812.tsv"
+```
+
+```{r}
+# Heatmap of significant genes not returned in any of the pathways
+sigGenes <- rownames(res)[which(res$padj < 0.05)]
+
+    # Parse significant pathways
+    getSigPathways <- function(GSEAReport = NULL, qValue = 0.001, GMTFile = NULL) {
+      # Read in the GSEA report
+      GSEAReport <- read.delim(GSEAReport, header = TRUE, sep = "\t")
+      # Select all pathways with FDR val < qValue
+      GSEAReport <- GSEAReport[GSEAReport$FDR.q.val < qValue,]
+        
+      # Get significant pathways
+      sigPathways <- which(GMTFile$geneset.name %in% GSEAReport$NAME)
+      sigGenes <- unlist(GMTFile$genesets[sigPathways])
+      return(sigGenes)
+    }
+
+downregulated <- getSigPathways(GSEAReport = negative, GMTFile = GMT)
+upregulated <- getSigPathways(GSEAReport = positive, GMTFile = GMT)
+    
+# Take diff of significant genes and genes in significant pathways
+darkMatter <- setdiff(sigGenes, c(downregulated, upregulated))
+    
+print(length(darkMatter))
+```
+
+```{r}
+# Heatmap of darkMatter genes (not in any significant pathways) plotted with z-score
+# of log2 fold change
+
+# Subset the data to only include the dark matter genes
+darkMatterData <- assay(dds)[darkMatter,]
+plotHeatmap <- function(countsMatrix, title) { # Code adapted from assignment 2
+  # Calculate z-scores
+  zScores <- t(scale(t(countsMatrix)))
+  
+  # rename columns
+  colnames(zScores) <- c("Control 1", "Control 2", "Control 3", "Control 4", "Control 5", "Treatment 1", "Treatment 2", "Treatment 3", "Treatment 4", "Treatment 5")
+
+  # Create the heatmap
+  p <- Heatmap(zScores, name = "Z-score", col = viridis(10), show_row_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_column_names = TRUE, column_title=title)
+  return(p)
+}
+p <- plotHeatmap(countsMatrix = darkMatterData, title = "Significant Genes Absent from Significant Pathways")
+
+p
+```
+!(Figure 4)[/home/rstudio/projects/figures/darkMatterGenesF1.png]
+**Figure 4**: Heatmap of z-scores for expression of 'dark matter' significant genes
+lacking a representative in any of the significant pathways returned by the GSEA.
+235/345 (68%) of the significant (q-value < 0.05) genes qualify as 'dark matter' and
+include both upregulated and downregulated genes.
+
+```{r}
+# significant genes that are not present in ANY of the pathways (regardless of significance)
+
+allGenes <- unique(unlist(GMT$genesets))
+
+# Take diff of significant genes and genes in all pathways
+rlyDarkMatter <- setdiff(sigGenes, allGenes)
+
+length(rlyDarkMatter)
+
+rlyDarkMatterData <- assay(dds)[rlyDarkMatter,]
+p2 <- plotHeatmap(countsMatrix = rlyDarkMatterData, title = "Significant Genes with No Representation in Any Pathways")
+p2
+```
+!(Figure 5)[/home/rstudio/projects/figures/darkMatterGenesF2.png]
+**Figure 5** Heatmap of z-scores for genes without any representation in any pathways,
+regardless of significance. 117/345 (~33%) of all significant genes were not present in
+any of the pathways tested. Many of these genes have few, if any, functional annotations and
+include the most significant gene, C1orf173 (p_adj = 1.92e-31, log2fc = 7.14).
+
+```{r}
+# Print top 10 dark matter genes by p val
+darkMatterPvals <- res[rownames(res) %in% darkMatter,]
+darkMatterPvals <- darkMatterPvals[order(darkMatterPvals$pvalue),]
+head(darkMatterPvals, 10)
+```
+Among the others are several noncoding RNAs (RP1-71H24 and LINC00487) of unknown function.
+There are some genes here with known function, though, such as CYP2J2 and PARP9. 
+
